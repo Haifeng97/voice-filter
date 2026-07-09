@@ -22,41 +22,39 @@ DEFAULT_OUTPUT = "/data/haifengjia/filter/duplexconv_speaker_profile.jsonl"
 
 SYSTEM_PROMPT = (
     "你是一名语音说话人描述助手。"
-    "你的任务是根据音频生成自然中文描述，"
+    "你的任务是根据音频生成一句自然中文说话人描述，"
     "重点描述听感性别、年龄感知、声音特点、说话方式和当前交流印象。"
-    "必须严格输出 JSON。"
+    "必须严格输出一个 JSON 对象。"
+    "不要转写音频。"
     "不要输出 Markdown。"
     "不要输出 JSON 以外的任何内容。"
 )
 
 
 USER_PROMPT = """
-请根据音频中主要说话人的声音和说话方式，输出 JSON。
+请根据音频中主要说话人的声音和说话方式，只输出一个 JSON 对象。
 
-只输出 JSON，不要输出 Markdown，不要输出解释，不要输出 JSON 以外的任何内容。
+不要转写音频，不要解释，不要输出 Markdown，不要输出 JSON 以外的任何内容。
 
-输出结构如下：
+输出结构固定如下：
 
 {
-  "transcript": "音频转写文本，听不清则为空字符串",
-  "speaker_description": "一句自然中文描述，必须包含：听感性别、年龄感知、声音特点、说话方式或性格印象",
-  "perceived_gender": "male | female | child | uncertain",
-  "age_estimate_text": "例如：20岁左右、30岁左右、儿童、青少年、中年、年龄不确定但听感偏年轻",
-  "summary": "一句自然中文总结"
+  "speaker_description": "一句自然中文描述"
 }
 
-要求：
-1. perceived_gender 必须给出听感判断。若非常不确定，使用 uncertain，但 summary 里要写清楚“性别不太确定，听感偏……”。
-2. age_estimate_text 必须写成自然中文，不要只写枚举。可以写“20岁左右”“30岁左右”“年龄不确定但听感偏年轻”“像儿童或青少年”。
-3. speaker_description 和 summary 都要自然、好读，不要像表格字段。
-4. summary 推荐格式：
-   “听感上像一位女性，年龄可能在20岁左右；声音偏高，语速较慢，语气可爱、撒娇，像是在和亲近的人开玩笑。”
-5. 年龄和性别都只是根据声音得到的感知结果，不代表真实身份。
-6. 性格只描述这段音频里呈现出的交流印象，不代表长期人格。
-7. 不要推断职业、学历、地域、民族、健康状况、真实身份。
-8. summary 不超过 120 个中文字。
-""".strip()
+speaker_description 要求：
+1. 必须包含听感性别、年龄感知、声音特点、说话方式或当前交流印象。
+2. 年龄和性别只是根据声音得到的感知结果，不代表真实身份。
+3. 性格只描述这段音频里呈现出的交流印象，不代表长期人格。
+4. 不要推断职业、学历、地域、民族、健康状况、真实身份。
+5. 不超过 90 个中文字。
+6. 只写一句话。
 
+示例：
+{
+  "speaker_description": "听感上像一位20岁左右的女性，声音偏高且清亮，语速较慢，语气轻松亲近，像是在和熟人开玩笑。"
+}
+""".strip()
 
 def run_cmd(cmd: list[str], timeout: int | float | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -309,34 +307,95 @@ def extract_json_obj(text: str) -> dict[str, Any]:
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
     cleaned = re.sub(r"\s*```.*$", "", cleaned, flags=re.S)
 
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
+    required_keys = {
+        "transcript",
+        "speaker_description",
+        "perceived_gender",
+        "age_estimate_text",
+        "summary",
+    }
+    decoder = json.JSONDecoder()
+    candidates = []
 
-    if start < 0 or end <= start:
-        raise ValueError("没有找到 JSON 对象")
+    def scan(s: str) -> None:
+        pos = 0
+        while True:
+            start = s.find("{", pos)
+            if start < 0:
+                return
 
-    cleaned = cleaned[start:end + 1]
-    return json.loads(cleaned)
+            try:
+                obj, end = decoder.raw_decode(s[start:])
+            except json.JSONDecodeError:
+                pos = start + 1
+                continue
+
+            if isinstance(obj, dict):
+                score = sum(1 for key in required_keys if key in obj)
+                if str(obj.get("speaker_description", "") or "").strip():
+                    score += 10
+                candidates.append((score, obj))
+
+            pos = start + max(end, 1)
+
+    scan(cleaned)
+
+    # Some Step-Audio outputs repeat the JSON as escaped text, e.g. {\"key\": ...}.
+    if '\\"' in cleaned:
+        scan(cleaned.replace('\\"', '"'))
+
+    if not candidates:
+        raise ValueError("没有找到可解析的 JSON 对象")
+
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def add_timestamp_suffix(path: Path, timestamp: str | None = None) -> Path:
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    return path.with_name(f"{path.stem}_{timestamp}{path.suffix}")
 
 
 def normalize_result(obj: dict[str, Any]) -> dict[str, Any]:
     allowed_gender = {"male", "female", "child", "uncertain"}
-
-    gender = obj.get("perceived_gender", "uncertain")
-    if gender not in allowed_gender:
-        gender = "uncertain"
 
     transcript = str(obj.get("transcript", "") or "").strip()
     speaker_description = str(obj.get("speaker_description", "") or "").strip()
     age_estimate_text = str(obj.get("age_estimate_text", "") or "").strip()
     summary = str(obj.get("summary", "") or "").strip()
 
+    gender = obj.get("perceived_gender", "uncertain")
+    if gender not in allowed_gender:
+        gender = "uncertain"
+
+    combined_text = f"{speaker_description} {summary} {age_estimate_text}"
+
+    if gender == "uncertain":
+        if any(x in combined_text for x in ("儿童", "童声", "小孩", "小女孩", "小男孩")):
+            gender = "child"
+        elif any(x in combined_text for x in ("女性", "女声", "女生", "女孩")):
+            gender = "female"
+        elif any(x in combined_text for x in ("男性", "男声", "男生", "男孩")):
+            gender = "male"
+
+    if not age_estimate_text:
+        age_match = re.search(
+            r"(\d{1,2}\s*[-到~－]\s*\d{1,2}\s*岁|\d{1,2}\s*岁左右|儿童（[^）]+）|儿童|青少年|青年|年轻|中年|老年)",
+            combined_text,
+        )
+        if age_match:
+            age_estimate_text = re.sub(r"\s+", "", age_match.group(1))
+
+    if not summary and speaker_description:
+        summary = speaker_description.split("。", 1)[0].strip()
+        if summary and not summary.endswith("。"):
+            summary += "。"
+
     return {
         "transcript": transcript,
-        "speaker_description": speaker_description[:200],
+        "speaker_description": speaker_description,
         "perceived_gender": gender,
-        "age_estimate_text": age_estimate_text[:80],
-        "summary": summary[:200],
+        "age_estimate_text": age_estimate_text,
+        "summary": summary,
     }
 
 
@@ -373,6 +432,7 @@ async def call_stepaudio(
                     ],
                 },
             ],
+            stop=["</tool_call>", "<中文>"],
             extra_body={
                 "sampling_params_list": [
                     {
@@ -398,9 +458,8 @@ async def process_one(
     job: dict[str, Any],
     idx: int,
     args: argparse.Namespace,
-    api_bases: list[str],
-    clients: dict[str, AsyncOpenAI],
-    endpoint_sems: dict[str, asyncio.Semaphore],
+    api_base: str,
+    client: AsyncOpenAI,
 ) -> dict[str, Any]:
     start_time = time.time()
 
@@ -425,7 +484,6 @@ async def process_one(
             "elapsed_sec": round(time.time() - start_time, 3),
         }
 
-    api_base = api_bases[idx % len(api_bases)]
     base_record["api_base"] = api_base
 
     last_error = None
@@ -442,14 +500,13 @@ async def process_one(
                 segment_duration=args.segment_duration,
             )
 
-            async with endpoint_sems[api_base]:
-                raw_text = await call_stepaudio(
-                    client=clients[api_base],
-                    model=args.model,
-                    audio_path=tmp_audio,
-                    max_tokens=args.max_tokens,
-                    timeout=args.timeout,
-                )
+            raw_text = await call_stepaudio(
+                client=client,
+                model=args.model,
+                audio_path=tmp_audio,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
+            )
 
             parsed = extract_json_obj(raw_text)
             normalized = normalize_result(parsed)
@@ -497,6 +554,9 @@ async def async_main(args: argparse.Namespace) -> None:
     api_bases = parse_api_bases(args.api_bases)
 
     output_path = Path(args.output)
+    if args.output_timestamp or args.test:
+        output_path = add_timestamp_suffix(output_path)
+        args.output = str(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     tasks = build_tasks(args)
@@ -520,48 +580,67 @@ async def async_main(args: argparse.Namespace) -> None:
         for api in api_bases
     }
 
-    endpoint_sems = {
-        api: asyncio.Semaphore(args.per_api_concurrency)
-        for api in api_bases
-    }
+    endpoint_slots: asyncio.Queue[str] = asyncio.Queue()
+    for api in api_bases:
+        for _ in range(args.per_api_concurrency):
+            endpoint_slots.put_nowait(api)
 
-    global_sem = asyncio.Semaphore(args.concurrency)
     write_lock = asyncio.Lock()
 
     ok_count = 0
     fail_count = 0
 
     async def runner(job: dict[str, Any], idx: int) -> dict[str, Any]:
-        async with global_sem:
+        api_base = await endpoint_slots.get()
+        try:
             return await process_one(
                 job=job,
                 idx=idx,
                 args=args,
-                api_bases=api_bases,
-                clients=clients,
-                endpoint_sems=endpoint_sems,
+                api_base=api_base,
+                client=clients[api_base],
             )
+        finally:
+            endpoint_slots.put_nowait(api_base)
 
-    pending = [
-        asyncio.create_task(runner(job, idx))
-        for idx, job in enumerate(tasks)
-    ]
+    max_pending = min(args.concurrency, len(tasks))
+    task_iter = iter(enumerate(tasks))
+    pending = set()
+
+    for _ in range(max_pending):
+        try:
+            idx, job = next(task_iter)
+        except StopIteration:
+            break
+        pending.add(asyncio.create_task(runner(job, idx)))
 
     with output_path.open("a", encoding="utf-8", buffering=1) as f:
-        with tqdm(total=len(pending), desc="StepAudio profile", dynamic_ncols=True) as pbar:
-            for coro in asyncio.as_completed(pending):
-                rec = await coro
+        with tqdm(total=len(tasks), desc="StepAudio profile", dynamic_ncols=True) as pbar:
+            while pending:
+                done_set, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
-                async with write_lock:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                for task in done_set:
+                    rec = await task
 
-                if rec.get("parse_ok"):
-                    ok_count += 1
-                else:
-                    fail_count += 1
+                    async with write_lock:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-                pbar.set_postfix(ok=ok_count, fail=fail_count)
-                pbar.update(1)
+                    if rec.get("parse_ok"):
+                        ok_count += 1
+                    else:
+                        fail_count += 1
+
+                    pbar.set_postfix(ok=ok_count, fail=fail_count)
+                    pbar.update(1)
+
+                    try:
+                        idx, job = next(task_iter)
+                    except StopIteration:
+                        continue
+                    pending.add(asyncio.create_task(runner(job, idx)))
 
     print(f"完成：ok={ok_count}, fail={fail_count}, output={output_path}")
 
@@ -585,6 +664,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--output",
         default=DEFAULT_OUTPUT,
         help=f"输出 JSONL，默认 {DEFAULT_OUTPUT}",
+    )
+    p.add_argument(
+        "--output-timestamp",
+        action="store_true",
+        help="给输出文件名追加当前时间后缀；--test 默认也会追加。",
     )
 
     p.add_argument(
@@ -683,7 +767,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-tokens",
         type=int,
-        default=700,
+        default=300,
+        help="最大生成 token 数。只生成 speaker_description 时默认 300，主要防止异常跑飞。",
     )
 
     return p
